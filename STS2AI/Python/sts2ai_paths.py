@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 PYTHON_ROOT = Path(__file__).resolve().parent
@@ -16,7 +17,8 @@ SEEDS_ROOT = ASSETS_ROOT / "seeds"
 
 MAINLINE_CHECKPOINT = CHECKPOINTS_ROOT / "act1" / "mainline_iter2270_carddebug.pt"
 
-SIM_HOST_EXE = ENV_ROOT / "Sim" / "Host" / "bin" / "Debug" / "net9.0" / "headless_sim_host_0991.exe"
+_HOST_EXE_NAME = "headless_sim_host_0991.exe" if sys.platform == "win32" else "headless_sim_host_0991"
+SIM_HOST_EXE = ENV_ROOT / "Sim" / "Host" / "bin" / "Debug" / "net9.0" / _HOST_EXE_NAME
 SIM_LEGACY_DLL = ENV_ROOT / "Sim" / "Runtime" / "HeadlessSim" / "bin" / "Debug" / "net9.0" / "HeadlessSim.dll"
 SPECTATOR_MOD_ROOT = ENV_ROOT / "Spectator" / "SpectatorBridgeMod"
 

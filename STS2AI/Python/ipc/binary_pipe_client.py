@@ -225,9 +225,31 @@ class BinaryPipeClient(PipeClient):
         self._server_schema_hash: str | None = None
 
     def connect(self, timeout_s: float = 10.0) -> None:
-        if sys.platform != "win32":
-            raise RuntimeError("Named pipes are only supported on Windows")
+        if sys.platform == "win32":
+            self._connect_win32_binary(timeout_s)
+        else:
+            self._connect_posix_binary(timeout_s)
 
+    def _validate_handshake(self, hello: dict[str, Any]) -> None:
+        if hello.get("status") != STATUS_OK or hello.get("opcode") != OP_HANDSHAKE:
+            self.close()
+            raise ConnectionError(str(hello.get("error") or f"Unexpected binary handshake: {hello!r}"))
+        self._protocol_version = int(hello.get("version") or 0)
+        if self._protocol_version != PROTOCOL_VERSION:
+            self.close()
+            raise ConnectionError(
+                f"Binary protocol version mismatch: expected {PROTOCOL_VERSION}, got {self._protocol_version}"
+            )
+        self._server_build_git_sha = str(hello.get("build_git_sha") or "").strip() or None
+        self._server_schema_hash = str(hello.get("schema_hash") or "").strip() or None
+        if self._server_schema_hash != BINARY_SCHEMA_HASH:
+            self.close()
+            raise ConnectionError(
+                "Binary schema mismatch: "
+                f"expected {BINARY_SCHEMA_HASH}, got {self._server_schema_hash or '<missing>'}"
+            )
+
+    def _connect_win32_binary(self, timeout_s: float) -> None:
         pipe_path = f"\\\\.\\pipe\\{self.pipe_name}"
         deadline = time.monotonic() + timeout_s
         last_err = None
@@ -256,23 +278,7 @@ class BinaryPipeClient(PipeClient):
                 self._handle = handle
                 self._event = _kernel32.CreateEventW(None, True, False, None)
                 hello = self._read_response(timeout_s=timeout_s, expect_handshake=True)
-                if hello.get("status") != STATUS_OK or hello.get("opcode") != OP_HANDSHAKE:
-                    self.close()
-                    raise ConnectionError(str(hello.get("error") or f"Unexpected binary handshake: {hello!r}"))
-                self._protocol_version = int(hello.get("version") or 0)
-                if self._protocol_version != PROTOCOL_VERSION:
-                    self.close()
-                    raise ConnectionError(
-                        f"Binary protocol version mismatch: expected {PROTOCOL_VERSION}, got {self._protocol_version}"
-                    )
-                self._server_build_git_sha = str(hello.get("build_git_sha") or "").strip() or None
-                self._server_schema_hash = str(hello.get("schema_hash") or "").strip() or None
-                if self._server_schema_hash != BINARY_SCHEMA_HASH:
-                    self.close()
-                    raise ConnectionError(
-                        "Binary schema mismatch: "
-                        f"expected {BINARY_SCHEMA_HASH}, got {self._server_schema_hash or '<missing>'}"
-                    )
+                self._validate_handshake(hello)
                 return
             except (SimulatorApiError, ConnectionError):
                 raise
@@ -282,8 +288,33 @@ class BinaryPipeClient(PipeClient):
 
         raise ConnectionError(f"Failed to connect after {timeout_s}s: {last_err}")
 
+    def _connect_posix_binary(self, timeout_s: float) -> None:
+        import os
+        import socket
+        from pipe_client import _corefx_socket_path
+
+        path = _corefx_socket_path(self.pipe_name)
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if os.path.exists(path):
+                break
+            time.sleep(0.1)
+        else:
+            raise ConnectionError(f"Socket {path} never appeared within {timeout_s}s")
+
+        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._sock.settimeout(self.default_timeout_s)
+        try:
+            self._sock.connect(path)
+        except OSError as exc:
+            self._sock = None
+            raise ConnectionError(f"AF_UNIX connect failed: {exc}") from exc
+
+        hello = self._read_response(timeout_s=timeout_s, expect_handshake=True)
+        self._validate_handshake(hello)
+
     def call(self, method: str, params: dict[str, Any] | None = None, timeout_s: float | None = None) -> dict[str, Any]:
-        if self._handle is None:
+        if not self.is_connected():
             raise ConnectionError("Not connected. Call connect() first.")
         if timeout_s is None:
             timeout_s = self.default_timeout_s

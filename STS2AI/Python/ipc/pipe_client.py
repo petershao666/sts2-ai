@@ -3,9 +3,8 @@
 ~50x faster than HTTP for small JSON messages (no TCP handshake/headers).
 Protocol: 4-byte little-endian length prefix + UTF-8 JSON payload.
 
-Uses Windows overlapped I/O for reads with proper timeout support.
-Previous implementation used os.fdopen().read() which holds the GIL
-and cannot be interrupted by threading timeout.
+On Windows: uses overlapped I/O for reads with proper timeout support.
+On Mac/Linux: uses AF_UNIX socket (CoreFX maps NamedPipeServerStream → $TMPDIR/CoreFxPipe_<name>).
 
 Usage:
     from pipe_client import PipeClient
@@ -21,8 +20,9 @@ Usage:
 from __future__ import annotations
 
 import ctypes
-import ctypes.wintypes
 import json
+import os
+import socket
 import struct
 import sys
 import time
@@ -34,7 +34,8 @@ except ImportError:
     from simulator_api_error import SimulatorApiError
 
 
-# Windows constants
+# ── Windows constants (always defined so downstream `from pipe_client import ...`
+#    keeps working on POSIX; they're only used on Windows). ────────────────────
 GENERIC_READ = 0x80000000
 GENERIC_WRITE = 0x40000000
 OPEN_EXISTING = 3
@@ -44,96 +45,74 @@ WAIT_OBJECT_0 = 0
 WAIT_TIMEOUT = 0x102
 ERROR_IO_PENDING = 997
 
+if sys.platform == "win32":
+    import ctypes.wintypes
 
-class OVERLAPPED(ctypes.Structure):
-    _fields_ = [
-        ("Internal", ctypes.POINTER(ctypes.c_ulong)),
-        ("InternalHigh", ctypes.POINTER(ctypes.c_ulong)),
-        ("Offset", ctypes.wintypes.DWORD),
-        ("OffsetHigh", ctypes.wintypes.DWORD),
-        ("hEvent", ctypes.wintypes.HANDLE),
-    ]
+    class OVERLAPPED(ctypes.Structure):
+        _fields_ = [
+            ("Internal", ctypes.POINTER(ctypes.c_ulong)),
+            ("InternalHigh", ctypes.POINTER(ctypes.c_ulong)),
+            ("Offset", ctypes.wintypes.DWORD),
+            ("OffsetHigh", ctypes.wintypes.DWORD),
+            ("hEvent", ctypes.wintypes.HANDLE),
+        ]
+
+    _kernel32 = ctypes.windll.kernel32
+else:
+    _kernel32 = None
 
 
-_kernel32 = ctypes.windll.kernel32 if sys.platform == "win32" else None
+# ── POSIX helper ──────────────────────────────────────────────────────────────
+def _corefx_socket_path(pipe_name: str) -> str:
+    """Return the Unix domain socket path that CoreFX creates for pipe_name."""
+    # Mac: $TMPDIR = /var/folders/.../T/   Linux (Colab): $TMPDIR usually unset → /tmp
+    tmpdir = os.environ.get("TMPDIR", "/tmp").rstrip("/")
+    return f"{tmpdir}/CoreFxPipe_{pipe_name}"
 
 
 class PipeClient:
-    """Named pipe client using Windows overlapped I/O for timeout support."""
+    """Named pipe / Unix socket client for STS2 HeadlessSim IPC."""
 
     def __init__(self, port: int = 15527, pipe_name: str | None = None,
                  default_timeout_s: float = 30.0):
         self.pipe_name = pipe_name or f"sts2_mcts_{port}"
         self.default_timeout_s = default_timeout_s
+        # Windows handles
         self._handle = None
         self._event = None
+        # POSIX socket
+        self._sock: socket.socket | None = None
+
+    # ── public API ────────────────────────────────────────────────────────────
 
     def connect(self, timeout_s: float = 10.0) -> None:
-        """Connect to the named pipe. Retries until timeout."""
-        if sys.platform != "win32":
-            raise RuntimeError("Named pipes are only supported on Windows")
-
-        pipe_path = f"\\\\.\\pipe\\{self.pipe_name}"
-        deadline = time.monotonic() + timeout_s
-        last_err = None
-
-        while time.monotonic() < deadline:
-            try:
-                if not _kernel32.WaitNamedPipeW(pipe_path, 200):
-                    last_err = f"Pipe {pipe_path} not ready"
-                    time.sleep(0.1)
-                    continue
-
-                handle = _kernel32.CreateFileW(
-                    pipe_path,
-                    GENERIC_READ | GENERIC_WRITE,
-                    0,
-                    None,
-                    OPEN_EXISTING,
-                    FILE_FLAG_OVERLAPPED,  # Enable overlapped I/O
-                    None,
-                )
-                if handle == INVALID_HANDLE_VALUE:
-                    err = ctypes.GetLastError()
-                    last_err = f"CreateFileW failed: winerror={err}"
-                    time.sleep(0.1)
-                    continue
-
-                self._handle = handle
-                self._event = _kernel32.CreateEventW(None, True, False, None)
-
-                # Read handshake message from server
-                hello = self._read_message(timeout_s=timeout_s)
-                error = hello.get("error")
-                if error:
-                    self.close()
-                    raise SimulatorApiError(
-                        error,
-                        error_code=hello.get("error_code"),
-                    )
-                if not hello.get("ok"):
-                    self.close()
-                    raise ConnectionError(f"Unexpected handshake: {hello!r}")
-                return
-            except (SimulatorApiError, ConnectionError):
-                raise
-            except OSError as exc:
-                last_err = f"Pipe open failed: {exc}"
-                time.sleep(0.1)
-
-        raise ConnectionError(f"Failed to connect after {timeout_s}s: {last_err}")
+        """Connect to the simulator. Retries until timeout."""
+        if sys.platform == "win32":
+            self._connect_win32(timeout_s)
+        else:
+            self._connect_posix(timeout_s)
 
     def close(self) -> None:
-        """Close the pipe connection."""
-        if self._event is not None:
-            _kernel32.CloseHandle(self._event)
-            self._event = None
-        if self._handle is not None:
-            _kernel32.CloseHandle(self._handle)
-            self._handle = None
+        """Close the connection."""
+        if sys.platform == "win32":
+            if self._event is not None:
+                _kernel32.CloseHandle(self._event)
+                self._event = None
+            if self._handle is not None:
+                _kernel32.CloseHandle(self._handle)
+                self._handle = None
+        else:
+            if self._sock is not None:
+                try:
+                    self._sock.close()
+                except OSError:
+                    pass
+                self._sock = None
 
     def is_connected(self) -> bool:
-        return self._handle is not None
+        if sys.platform == "win32":
+            return self._handle is not None
+        return self._sock is not None
 
     def call(self, method: str, params: dict[str, Any] | None = None,
              timeout_s: float | None = None) -> dict:
@@ -152,7 +131,7 @@ class PipeClient:
             ConnectionError: if pipe is broken
             SimulatorApiError: if server returned an error
         """
-        if self._handle is None:
+        if not self.is_connected():
             raise ConnectionError("Not connected. Call connect() first.")
 
         if timeout_s is None:
@@ -178,8 +157,56 @@ class PipeClient:
 
         return result
 
-    def _write_bytes(self, data: bytes) -> None:
-        """Write bytes to pipe (synchronous, writes are fast)."""
+    # ── Windows implementation ────────────────────────────────────────────────
+
+    def _connect_win32(self, timeout_s: float) -> None:
+        pipe_path = f"\\\\.\\pipe\\{self.pipe_name}"
+        deadline = time.monotonic() + timeout_s
+        last_err = None
+
+        while time.monotonic() < deadline:
+            try:
+                if not _kernel32.WaitNamedPipeW(pipe_path, 200):
+                    last_err = f"Pipe {pipe_path} not ready"
+                    time.sleep(0.1)
+                    continue
+
+                handle = _kernel32.CreateFileW(
+                    pipe_path,
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_FLAG_OVERLAPPED,
+                    None,
+                )
+                if handle == INVALID_HANDLE_VALUE:
+                    err = ctypes.GetLastError()
+                    last_err = f"CreateFileW failed: winerror={err}"
+                    time.sleep(0.1)
+                    continue
+
+                self._handle = handle
+                self._event = _kernel32.CreateEventW(None, True, False, None)
+
+                hello = self._read_message(timeout_s=timeout_s)
+                error = hello.get("error")
+                if error:
+                    self.close()
+                    raise SimulatorApiError(error, error_code=hello.get("error_code"))
+                if not hello.get("ok"):
+                    self.close()
+                    raise ConnectionError(f"Unexpected handshake: {hello!r}")
+                return
+            except (SimulatorApiError, ConnectionError):
+                raise
+            except OSError as exc:
+                last_err = f"Pipe open failed: {exc}"
+                time.sleep(0.1)
+
+        raise ConnectionError(f"Failed to connect after {timeout_s}s: {last_err}")
+
+    def _write_bytes_win32(self, data: bytes) -> None:
         ovl = OVERLAPPED()
         ovl.hEvent = self._event
         _kernel32.ResetEvent(self._event)
@@ -195,13 +222,13 @@ class PipeClient:
         if not ok:
             err = ctypes.GetLastError()
             if err == ERROR_IO_PENDING:
-                _kernel32.WaitForSingleObject(self._event, 10000)  # 10s write timeout
+                _kernel32.WaitForSingleObject(self._event, 10000)
                 _kernel32.GetOverlappedResult(
                     self._handle, ctypes.byref(ovl), ctypes.byref(written), False)
             else:
                 raise ConnectionError(f"WriteFile failed: winerror={err}")
 
-    def _read_bytes(self, n: int, timeout_ms: int) -> bytes:
+    def _read_bytes_win32(self, n: int, timeout_ms: int) -> bytes:
         """Read exactly n bytes with timeout using overlapped I/O."""
         buf = ctypes.create_string_buffer(n)
         total_read = 0
@@ -222,7 +249,6 @@ class PipeClient:
             )
 
             if ok:
-                # Completed synchronously
                 total_read += bytes_read.value
                 if bytes_read.value == 0:
                     raise ConnectionError("Pipe closed by server")
@@ -232,7 +258,6 @@ class PipeClient:
             if err != ERROR_IO_PENDING:
                 raise ConnectionError(f"ReadFile failed: winerror={err}")
 
-            # Wait for overlapped read with timeout
             wait_result = _kernel32.WaitForSingleObject(self._event, timeout_ms)
 
             if wait_result == WAIT_TIMEOUT:
@@ -245,7 +270,6 @@ class PipeClient:
                 _kernel32.CancelIo(self._handle)
                 raise ConnectionError(f"WaitForSingleObject failed: {wait_result}")
 
-            # Get actual bytes read
             _kernel32.GetOverlappedResult(
                 self._handle, ctypes.byref(ovl), ctypes.byref(bytes_read), False)
             if bytes_read.value == 0:
@@ -254,19 +278,85 @@ class PipeClient:
 
         return buf.raw[:n]
 
+    # ── POSIX implementation ──────────────────────────────────────────────────
+
+    def _connect_posix(self, timeout_s: float) -> None:
+        path = _corefx_socket_path(self.pipe_name)
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if os.path.exists(path):
+                break
+            time.sleep(0.1)
+        else:
+            raise ConnectionError(
+                f"Socket {path} never appeared within {timeout_s}s")
+
+        self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._sock.settimeout(self.default_timeout_s)
+        try:
+            self._sock.connect(path)
+        except OSError as exc:
+            self._sock = None
+            raise ConnectionError(f"AF_UNIX connect failed: {exc}") from exc
+
+        hello = self._read_message(timeout_s=timeout_s)
+        error = hello.get("error")
+        if error:
+            self.close()
+            raise SimulatorApiError(error, error_code=hello.get("error_code"))
+        if not hello.get("ok"):
+            self.close()
+            raise ConnectionError(f"Unexpected handshake: {hello!r}")
+
+    def _recv_exact(self, n: int, timeout_ms: int) -> bytes:
+        """Read exactly n bytes from the POSIX socket."""
+        self._sock.settimeout(timeout_ms / 1000.0)
+        chunks: list[bytes] = []
+        received = 0
+        while received < n:
+            try:
+                chunk = self._sock.recv(n - received)
+            except socket.timeout:
+                raise TimeoutError(
+                    f"Socket read timed out after {timeout_ms}ms "
+                    f"(read {received}/{n} bytes)")
+            if not chunk:
+                raise ConnectionError("Pipe closed by server")
+            chunks.append(chunk)
+            received += len(chunk)
+        return b"".join(chunks)
+
+    # ── shared I/O dispatch ───────────────────────────────────────────────────
+
+    def _write_bytes(self, data: bytes) -> None:
+        if sys.platform == "win32":
+            self._write_bytes_win32(data)
+        else:
+            try:
+                self._sock.sendall(data)
+            except OSError as exc:
+                raise ConnectionError(f"Socket write failed: {exc}") from exc
+
+    def _read_bytes(self, n: int, timeout_ms: int) -> bytes:
+        """Read exactly n bytes. Platform-dispatched.
+
+        Used by subclasses (e.g. BinaryPipeClient) that need raw byte reads
+        instead of JSON-wrapped messages.
+        """
+        if sys.platform == "win32":
+            return self._read_bytes_win32(n, timeout_ms)
+        return self._recv_exact(n, timeout_ms)
+
     def _read_message(self, timeout_s: float = 30.0) -> dict[str, Any]:
         """Read one length-prefixed JSON message."""
         timeout_ms = int(timeout_s * 1000)
 
-        # Read 4-byte length header
         len_buf = self._read_bytes(4, timeout_ms)
         msg_len = struct.unpack("<I", len_buf)[0]
-
-        if msg_len > 10_000_000:  # 10MB safety limit
+        if msg_len > 10_000_000:
             raise RuntimeError(f"Response too large: {msg_len} bytes")
-
-        # Read message body
         msg_buf = self._read_bytes(msg_len, timeout_ms)
+
         return json.loads(msg_buf.decode("utf-8"))
 
     def __enter__(self):
