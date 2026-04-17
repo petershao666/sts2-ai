@@ -2340,14 +2340,21 @@ class TestEvaluateHarness:
         repo_root_expected = Path(__file__).resolve().parents[2]
         repo_root = Path(headless_sim_runner.DEFAULT_REPO_ROOT).resolve()
         dll_path = Path(headless_sim_runner.DEFAULT_DLL_PATH).resolve()
-        expected_candidates = [
-            repo_root_expected / "STS2AI/ENV/Sim/Host/bin/Debug/net9.0/headless_sim_host_0991.exe",
+        # POSIX builds drop the .exe suffix; accept both so the same test
+        # file passes on Windows, Mac, and Linux (Colab).
+        host_exe_names = ("headless_sim_host_0991.exe", "headless_sim_host_0991")
+        expected_candidates = []
+        for host_name in host_exe_names:
+            expected_candidates.extend([
+                repo_root_expected / f"STS2AI/ENV/Sim/Host/bin/Debug/net9.0/{host_name}",
+                repo_root_expected / f"STS2AI/overlay/headless-sim-host/bin/Debug/net9.0/{host_name}",
+                repo_root_expected / f"overlay/headless-sim-host/bin/Debug/net9.0/{host_name}",
+            ])
+        expected_candidates.extend([
             repo_root_expected / "STS2AI/ENV/Sim/Runtime/HeadlessSim/bin/Debug/net9.0/HeadlessSim.dll",
-            repo_root_expected / "STS2AI/overlay/headless-sim-host/bin/Debug/net9.0/headless_sim_host_0991.exe",
             repo_root_expected / "STS2AI/tools/headless-sim/HeadlessSim/bin/Debug/net9.0/HeadlessSim.dll",
-            repo_root_expected / "overlay/headless-sim-host/bin/Debug/net9.0/headless_sim_host_0991.exe",
             repo_root_expected / "tools/headless-sim/HeadlessSim/bin/Debug/net9.0/HeadlessSim.dll",
-        ]
+        ])
 
         assert repo_root == repo_root_expected
         assert dll_path in {candidate.resolve() for candidate in expected_candidates}
@@ -2358,14 +2365,21 @@ class TestEvaluateHarness:
         repo_root_expected = Path(__file__).resolve().parents[2]
         repo_root = Path(verify_save_load.DEFAULT_REPO_ROOT).resolve()
         dll_path = Path(verify_save_load.DEFAULT_HEADLESS_DLL).resolve()
-        expected_candidates = [
-            repo_root_expected / "STS2AI/ENV/Sim/Host/bin/Debug/net9.0/headless_sim_host_0991.exe",
+        # POSIX builds drop the .exe suffix; accept both so the same test
+        # file passes on Windows, Mac, and Linux (Colab).
+        host_exe_names = ("headless_sim_host_0991.exe", "headless_sim_host_0991")
+        expected_candidates = []
+        for host_name in host_exe_names:
+            expected_candidates.extend([
+                repo_root_expected / f"STS2AI/ENV/Sim/Host/bin/Debug/net9.0/{host_name}",
+                repo_root_expected / f"STS2AI/overlay/headless-sim-host/bin/Debug/net9.0/{host_name}",
+                repo_root_expected / f"overlay/headless-sim-host/bin/Debug/net9.0/{host_name}",
+            ])
+        expected_candidates.extend([
             repo_root_expected / "STS2AI/ENV/Sim/Runtime/HeadlessSim/bin/Debug/net9.0/HeadlessSim.dll",
-            repo_root_expected / "STS2AI/overlay/headless-sim-host/bin/Debug/net9.0/headless_sim_host_0991.exe",
             repo_root_expected / "STS2AI/tools/headless-sim/HeadlessSim/bin/Debug/net9.0/HeadlessSim.dll",
-            repo_root_expected / "overlay/headless-sim-host/bin/Debug/net9.0/headless_sim_host_0991.exe",
             repo_root_expected / "tools/headless-sim/HeadlessSim/bin/Debug/net9.0/HeadlessSim.dll",
-        ]
+        ])
 
         assert repo_root == repo_root_expected
         assert dll_path in {candidate.resolve() for candidate in expected_candidates}
